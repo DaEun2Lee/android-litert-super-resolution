@@ -1,195 +1,398 @@
 # Android LiteRT Super-Resolution Demo
 
-첨부 프로젝트를 수정해 **Android에서 실제 LiteRT 모델을 열고, 입력 이미지를 4배로 확대한 뒤 화면에 출력하는 전체 예제**로 구성했습니다.
+[한국어 README](README_KOR.md)
 
-## 핵심 동작
+An Android demo that runs a **4× image super-resolution TFLite model on-device** using Google's **LiteRT `CompiledModel` API**.
+
+The app converts a selected Android `Bitmap` into an RGB `Float32` tensor, executes the model on **GPU or CPU**, reads the output tensor back, and renders the 4× result in Jetpack Compose.
+
+> **Important model note**
+>
+> The repository includes `app/src/main/assets/sr_x4.tflite` so the full Android inference pipeline works immediately without downloading a model. The bundled model is a **deployment test graph**, not the trained ESRGAN network. It has the same 50×50 → 200×200 x4 interface and is intended to validate model loading, tensor I/O, GPU/CPU execution, and rendering. Use the provided download script to replace it with the official ESRGAN TFLite model when perceptual SR quality is required.
+
+---
+
+## Demo
+
+### Example 1
+
+<img src="docs/images/result_dolphin.jpg" width="420" alt="LiteRT super-resolution result - dolphin">
+
+Measured on the test device:
+
+| Stage | Time |
+|---|---:|
+| Backend | GPU |
+| Compile + warm-up | 944.53 ms |
+| Preprocess | 1.12 ms |
+| Inference + readback | 45.08 ms |
+| Postprocess | 12.38 ms |
+| **Total per image** | **58.58 ms** |
+
+### Example 2
+
+<img src="docs/images/result_cyborg.jpg" width="420" alt="LiteRT super-resolution result - cyborg portrait">
+
+Measured on the same test device:
+
+| Stage | Time |
+|---|---:|
+| Backend | GPU |
+| Compile + warm-up | 944.53 ms |
+| Preprocess | 1.64 ms |
+| Inference + readback | 45.06 ms |
+| Postprocess | 15.17 ms |
+| **Total per image** | **61.86 ms** |
+
+The initialization cost is shown separately because model compilation/warm-up happens before per-image inference. Runtime measurements can vary by device, thermal state, GPU driver, image content, and model.
+
+---
+
+## Inference Pipeline
 
 ```text
-Android Bitmap
-  -> 중앙 정사각형 crop + 50 x 50 resize
-  -> NHWC RGB Float32 (0..255)
-  -> LiteRT CompiledModel
-  -> CPU 또는 GPU
-  -> NHWC RGB Float32 (0..255), 200 x 200
-  -> ARGB_8888 Bitmap
-  -> Compose UI
+Source image (Bitmap)
+        |
+        v
+Center crop + resize to 50 x 50
+        |
+        v
+RGB Float32 tensor
+[1, 50, 50, 3]
+        |
+        v
+TensorBuffer.writeFloat()
+        |
+        v
+LiteRT CompiledModel
+        |
+        |  model.run(...)
+        v
+GPU / CPU inference
+        |
+        v
+Output Float32 tensor
+[1, 200, 200, 3]
+        |
+        v
+TensorBuffer.readFloat()
+        |
+        v
+RGB Float32 -> ARGB_8888 Bitmap
+        |
+        v
+200 x 200 output image
 ```
 
-앱 시작 시 `AUTO` backend로 모델을 compile/warm-up합니다. `AUTO`는 GPU를 먼저 시도하고, GPU에서 모델을 열거나 실행하지 못하면 CPU로 fallback합니다. 화면에서 `CPU`, `GPU`, `AUTO`를 직접 다시 선택할 수도 있습니다.
+The model contract used by this demo is:
 
-## 모델에 관한 중요한 안내
+- Input: `Float32 [1, 50, 50, 3]`
+- Output: `Float32 [1, 200, 200, 3]`
+- Layout: NHWC
+- Channels: RGB
+- Scale: 4×
 
-프로젝트에는 `app/src/main/assets/sr_x4.tflite`가 이미 들어 있으므로 **별도 Python 패키지나 모델 다운로드 없이도 모델 로딩과 추론 경로를 검증할 수 있습니다.**
+---
 
-기본 모델은 다음 그래프를 가진 작은 배포 검증용 TFLite 모델입니다.
+## Core LiteRT Code
+
+The most important code is in `SrRunner.kt`.
+
+### 1. Select the execution backend
+
+```kotlin
+val accelerator = when (backend) {
+    ExecutionBackend.CPU -> Accelerator.CPU
+    ExecutionBackend.GPU -> Accelerator.GPU
+}
+```
+
+`AUTO` mode tries GPU first and falls back to CPU if GPU model initialization or warm-up fails.
+
+### 2. Load the `.tflite` model
+
+```kotlin
+val model = CompiledModel.create(
+    assetManager,
+    "sr_x4.tflite",
+    CompiledModel.Options(accelerator),
+    null,
+)
+```
+
+`CompiledModel.create()` loads the model from the APK assets and prepares it for the selected accelerator.
+
+### 3. Create input/output tensor buffers
+
+```kotlin
+val inputBuffers = model.createInputBuffers()
+val outputBuffers = model.createOutputBuffers()
+```
+
+These buffers are created once and reused across inference calls.
+
+### 4. Write the input tensor
+
+```kotlin
+inputBuffers.single().writeFloat(prepared.tensor)
+```
+
+The Android `Bitmap` is not passed directly to the model. `BitmapSrCodec` first crops/resizes the image and converts its pixels into an RGB `FloatArray` matching `[1, 50, 50, 3]`.
+
+### 5. Run the ML model
+
+```kotlin
+model.run(
+    inputBuffers,
+    outputBuffers,
+)
+```
+
+**This is the actual ML inference call.** LiteRT executes the TFLite graph on the selected GPU or CPU backend.
+
+### 6. Read the output tensor
+
+```kotlin
+val output = outputBuffers.single().readFloat()
+```
+
+The result is an RGB `FloatArray` with the output shape `[1, 200, 200, 3]`. The app then converts it back to an Android `Bitmap`.
+
+So the core inference path is simply:
+
+```kotlin
+inputBuffers.single().writeFloat(rgbInput)
+model.run(inputBuffers, outputBuffers)
+val rgbOutput = outputBuffers.single().readFloat()
+```
+
+---
+
+## Model Initialization and Warm-up
+
+The app initializes the model on a dedicated single-thread coroutine dispatcher rather than blocking the UI thread.
 
 ```text
-[1, 50, 50, 3] Float32
-  -> Conv2D 1 x 1, 48 channels
-  -> DepthToSpace, block size 4
-  -> [1, 200, 200, 3] Float32
+AUTO
+ |
+ +--> try GPU
+ |      |
+ |      +--> create CompiledModel
+ |      +--> create TensorBuffers
+ |      +--> warm-up inference
+ |      +--> success -> use GPU
+ |
+ +--> GPU failure -> create/warm-up CPU model
 ```
 
-고정 가중치로 RGB 픽셀을 4배 복제하므로, **LiteRT 실행 여부를 검증하기 위한 모델이지 학습된 ESRGAN 품질 모델은 아닙니다.** 실제 perceptual SR 결과가 필요하면 아래 한 줄로 Google 공식 ESRGAN 모델로 교체하십시오.
+Warm-up runs a zero-filled input once before normal inference. This helps detect unsupported operators/backend problems early and validates that the model returns the expected output size.
+
+The UI reports this initialization cost as **Compile + warm-up** separately from per-image inference time.
+
+---
+
+## Bundled Model vs. ESRGAN
+
+### Bundled model
+
+The repository is immediately runnable with:
+
+```text
+app/src/main/assets/sr_x4.tflite
+```
+
+The bundled model is a small self-contained TFLite deployment test graph:
+
+```text
+Float32 [1, 50, 50, 3]
+        |
+        v
+Conv2D 1 x 1, 48 channels
+        |
+        v
+DepthToSpace, block size 4
+        |
+        v
+Float32 [1, 200, 200, 3]
+```
+
+It is useful for validating the Android/LiteRT execution pipeline, but it is **not the trained ESRGAN model**.
+
+### Replace with the official ESRGAN TFLite model
+
+The project includes helper scripts that download the official TensorFlow ESRGAN TFLite model and replace the bundled asset while preserving the same file name expected by the Android app.
+
+Windows / Python:
 
 ```powershell
 py -3 .\tools\download_official_esrgan.py
 ```
 
-또는:
+PowerShell:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\download_official_esrgan.ps1
 ```
 
-이 스크립트는 TensorFlow, TensorFlow Hub, `pkg_resources`, `setuptools`를 사용하지 않습니다. Python 표준 라이브러리만으로 공식 모델을 받아 같은 파일명인 `sr_x4.tflite`로 원자적으로 교체합니다.
-
-## 개발 환경
-
-프로젝트 설정은 첨부된 원본의 최신 구성에 맞췄습니다.
-
-- Android Gradle Plugin: `9.3.1`
-- Gradle wrapper: `9.5.0`
-- Kotlin: `2.2.10`
-- LiteRT Android: `com.google.ai.edge.litert:litert:2.1.0`
-- `compileSdk`: Android API `36.1`
-- `targetSdk`: `36`
-- `minSdk`: `26`
-- JDK: `17` 이상
-
-처음 열 때 Android Studio에서 SDK Platform 36.1과 필요한 dependency를 설치/동기화해야 합니다.
-
-## Windows에서 실행
-
-1. ZIP을 원하는 폴더에 풉니다.
-2. Android Studio에서 프로젝트 루트의 `settings.gradle.kts`를 엽니다.
-3. Gradle Sync가 끝날 때까지 dependency를 받습니다.
-4. API 26 이상 실제 기기 또는 emulator를 선택합니다.
-5. `app`을 Run합니다.
-6. 앱이 시작되면 backend 초기화가 끝난 후 `Run 4x SR`을 누릅니다.
-
-CLI build:
+After replacement, rebuild the APK:
 
 ```powershell
-cd C:\path\to\srdemo_fixed
+.\gradlew.bat clean :app:assembleDebug
+```
+
+The Android-side LiteRT inference code does not need to change as long as the model keeps the expected input/output contract.
+
+Official TensorFlow super-resolution example:
+
+- https://www.tensorflow.org/lite/models/super_resolution/overview
+
+---
+
+## Main Project Components
+
+### `SrRunner.kt`
+
+Owns the LiteRT runtime lifecycle:
+
+- selects CPU/GPU backend
+- creates `CompiledModel`
+- creates and reuses input/output `TensorBuffer`s
+- performs warm-up
+- executes `model.run()`
+- reads output tensors
+- measures inference/readback latency
+- releases LiteRT native resources
+
+### `BitmapSrCodec.kt`
+
+Handles image preprocessing and output conversion:
+
+- center-crops the source image
+- resizes to 50×50
+- converts Android ARGB pixels to RGB `Float32`
+- converts model RGB `Float32` output back to ARGB bitmap pixels
+
+### `ArgbTensorCodec.kt`
+
+Contains low-level RGB/ARGB conversion logic and bounds checking.
+
+### `MainActivity.kt`
+
+Coordinates app lifecycle, image selection, backend initialization, and inference requests.
+
+### `SrScreen.kt`
+
+Jetpack Compose UI that provides:
+
+- `AUTO`, `CPU`, and `GPU` backend selection
+- image picker
+- SR execution button
+- source image preview
+- actual 50×50 model input preview
+- 200×200 output preview
+- compile/warm-up and inference timing
+
+---
+
+## Build Environment
+
+The project was configured with:
+
+- Android Gradle Plugin: `9.3.1`
+- Gradle: `9.5.0`
+- Kotlin: `2.2.10`
+- LiteRT Android: `com.google.ai.edge.litert:litert:2.1.0`
+- `compileSdk`: `37`
+- `targetSdk`: `36`
+- `minSdk`: `26`
+- JDK: 17+
+
+Install Android SDK Platform 37 before building.
+
+---
+
+## Build
+
+### Android Studio
+
+1. Open the project root in Android Studio.
+2. Let Gradle Sync finish.
+3. Select an Android API 26+ physical device or emulator.
+4. Run the `app` configuration.
+5. Wait for model initialization.
+6. Choose an image and press **Run SR**.
+
+### Command line on Windows
+
+```powershell
 .\gradlew.bat :app:assembleDebug
 ```
 
-생성 APK:
+The debug APK is generated at:
 
 ```text
 app\build\outputs\apk\debug\app-debug.apk
 ```
 
-설치:
+Install it with ADB:
 
 ```powershell
-adb install -r .\app\build\outputs\apk\debug\app-debug.apk
+& "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" install -r `
+  .\app\build\outputs\apk\debug\app-debug.apk
 ```
 
-## 테스트
+---
 
-### 1. 인터넷과 Android SDK가 없어도 가능한 구조 검사
+## Verification and Tests
+
+### Static/offline project checks
 
 ```powershell
 py -3 .\tools\verify_project.py
 py -3 .\tools\inspect_tflite.py --verify-sr-contract
 ```
 
-확인 항목:
+These checks verify, among other things:
 
-- 필수 프로젝트 파일
-- Android XML parse
-- LiteRT dependency와 `noCompress` 설정
-- 모델의 `TFL3` identifier
-- TFLite schema version 3
-- 입력 `Float32 [1,50,50,3]`
-- 출력 `Float32 [1,200,200,3]`
-- `CompiledModel` / `TensorBuffer` lifecycle API 사용
-- APK assets 안에 불필요한 Python 파일이 없는지
+- TFLite `TFL3` identifier
+- TFLite schema
+- input/output tensor shape
+- LiteRT dependency and model asset configuration
+- `CompiledModel` / `TensorBuffer` lifecycle usage
 
-### 2. JVM unit test
+### JVM unit test
 
 ```powershell
 .\gradlew.bat :app:testDebugUnitTest
 ```
 
-`ArgbTensorCodecTest`가 ARGB/RGB channel 순서와 float clamp/rounding을 검증합니다.
+### Android instrumentation test
 
-### 3. 실제 Android LiteRT 추론 instrumentation test
-
-실제 기기 또는 emulator가 연결된 상태에서:
+With a device/emulator connected:
 
 ```powershell
 .\gradlew.bat :app:connectedDebugAndroidTest
 ```
 
-`SrModelInstrumentedTest`는 다음을 실제 Android runtime에서 수행합니다.
+The instrumentation test opens the model on Android, performs a real `CompiledModel.run()` call, reads the output, and validates the 50×50 input / 200×200 output path.
 
-- assets의 `sr_x4.tflite` 열기
-- CPU backend compile 및 warm-up
-- 실제 `CompiledModel.run()` 호출
-- 출력 readback
-- 50 x 50 input preview 확인
-- 200 x 200 output bitmap 확인
+---
 
-## 주요 코드
-
-### `SrRunner.kt`
-
-LiteRT 모델과 native resource를 관리하는 핵심 코드입니다.
-
-```kotlin
-val model = CompiledModel.create(
-    assetManager,
-    "sr_x4.tflite",
-    CompiledModel.Options(Accelerator.GPU),
-    null,
-)
-
-val inputs = model.createInputBuffers()
-val outputs = model.createOutputBuffers()
-
-inputs.single().writeFloat(rgbInput)
-model.run(inputs, outputs)
-val rgbOutput = outputs.single().readFloat()
-```
-
-구현에서는 이 객체들을 매 추론마다 만들지 않고 session 동안 재사용합니다. create/run/read/close를 한 전용 dispatcher에 가두고, Activity 종료 시 input buffer, output buffer, model, dispatcher를 닫습니다.
-
-### `BitmapSrCodec.kt`
-
-- 원본의 중앙 정사각형 영역 crop
-- 50 x 50 resize
-- Android ARGB -> 모델 RGB Float32 변환
-- 모델 RGB Float32 -> Android ARGB 변환
-
-### `MainActivity.kt`
-
-- Compose UI state 관리
-- 시스템 image picker
-- 큰 이미지 downsample decode
-- lifecycle coroutine에서 backend 초기화와 추론 실행
-- cancellation을 일반 오류로 오인하지 않도록 처리
-
-### `SrScreen.kt`
-
-- AUTO/CPU/GPU 선택
-- 원본, 실제 50 x 50 모델 입력, 200 x 200 출력 표시
-- compile/warm-up 및 전처리/추론/readback/후처리 시간 표시
-
-## 전체 파일 구조
+## Project Structure
 
 ```text
-srdemo_fixed/
+.
 ├── README.md
-├── TEST_REPORT.md
+├── README_KOR.md
 ├── settings.gradle.kts
 ├── build.gradle.kts
 ├── gradle.properties
 ├── gradlew
 ├── gradlew.bat
-├── gradle/
+├── docs/
+│   └── images/
+│       ├── result_dolphin.jpg
+│       └── result_cyborg.jpg
 ├── tools/
 │   ├── download_official_esrgan.py
 │   ├── download_official_esrgan.ps1
@@ -198,30 +401,33 @@ srdemo_fixed/
 │   ├── inspect_tflite.py
 │   └── verify_project.py
 └── app/
-    ├── build.gradle.kts
     └── src/
         ├── main/
-        │   ├── AndroidManifest.xml
         │   ├── assets/sr_x4.tflite
-        │   ├── java/com/delee/srdemo/
-        │   │   ├── MainActivity.kt
-        │   │   ├── SampleImageFactory.kt
-        │   │   ├── SrUiState.kt
-        │   │   ├── sr/
-        │   │   │   ├── ArgbTensorCodec.kt
-        │   │   │   ├── BitmapSrCodec.kt
-        │   │   │   └── SrRunner.kt
-        │   │   └── ui/SrScreen.kt
-        │   └── res/
+        │   └── java/.../
+        │       ├── MainActivity.kt
+        │       ├── SrUiState.kt
+        │       ├── sr/
+        │       │   ├── ArgbTensorCodec.kt
+        │       │   ├── BitmapSrCodec.kt
+        │       │   └── SrRunner.kt
+        │       └── ui/SrScreen.kt
         ├── test/
-        │   └── .../ArgbTensorCodecTest.kt
         └── androidTest/
-            └── .../SrModelInstrumentedTest.kt
 ```
 
-## 공식 참고 자료
+---
 
-- LiteRT CompiledModel Android/Kotlin: https://ai.google.dev/edge/litert/next/android_kotlin
-- LiteRT sample lifecycle: https://github.com/google-ai-edge/litert-samples
-- Google TensorFlow SR Android example: https://github.com/tensorflow/examples/tree/master/lite/examples/super_resolution/android
-- 공식 ESRGAN 모델 다운로드 정의: https://github.com/tensorflow/examples/blob/master/lite/examples/super_resolution/android/app/download.gradle
+## References
+
+- LiteRT: https://ai.google.dev/edge/litert
+- LiteRT CompiledModel API for Android/Kotlin: https://ai.google.dev/edge/litert/next/android_kotlin
+- Google AI Edge LiteRT samples: https://github.com/google-ai-edge/litert-samples
+- TensorFlow Lite Super Resolution / ESRGAN example: https://www.tensorflow.org/lite/models/super_resolution/overview
+- TensorFlow Android Super Resolution sample: https://github.com/tensorflow/examples/tree/master/lite/examples/super_resolution/android
+
+---
+
+## Notes
+
+This project is intentionally a **Bitmap-based inference baseline**. For real-time video SR, the next step would be to avoid repeated Bitmap/CPU-memory copies and connect decoder output to GPU-friendly buffers/textures before LiteRT inference.
