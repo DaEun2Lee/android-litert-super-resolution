@@ -1,0 +1,17 @@
+<resources>
+    <string name="app_name">SR Demo</string>
+    <string name="app_title">Android LiteRT Super-Resolution</string>
+    <string name="app_subtitle">50×50 RGB Float32 input → 200×200 RGB Float32 output. AUTO tries GPU first and falls back to CPU.</string>
+    <string name="accelerator">Execution backend</string>
+    <string name="choose_image">Choose image</string>
+    <string name="run_sr">Run SR</string>
+    <string name="source_image">Source image</string>
+    <string name="model_input">Actual model input</string>
+    <string name="sr_output">4× output</string>
+    <string name="status">Status</string>
+    <string name="active_backend">Active backend: %1$s</string>
+    <string name="initialization_time">Compile + warm-up: %1$s</string>
+    <string name="timing_title">Timing</string>
+    <string name="timing_format">Preprocess: %1$s\nInference + readback: %2$s\nPostprocess: %3$s\nTotal: %4$s</string>
+    <string name="model_notice">The bundled sr_x4.tflite is a self-contained deployment test graph (1×1 Conv2D + DepthToSpace). Run tools/download_official_esrgan.ps1 to replace it with the trained official ESRGAN model for perceptual SR quality.</string>
+</resources>

@@ -1,0 +1,6 @@
+package androidx.compose.runtime
+import kotlin.reflect.KProperty
+class MutableState<T>(var value: T)
+fun <T> mutableStateOf(value: T): MutableState<T> = MutableState(value)
+operator fun <T> MutableState<T>.getValue(thisRef: Any?, property: KProperty<*>): T = value
+operator fun <T> MutableState<T>.setValue(thisRef: Any?, property: KProperty<*>, newValue: T) { value = newValue }
